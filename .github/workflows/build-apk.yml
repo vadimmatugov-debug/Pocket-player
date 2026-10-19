@@ -1,0 +1,786 @@
+name: Build Pocket Player Nano UI APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+    paths:
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Verify preinstalled Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=${ANDROID_HOME:-unset}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-unset}"
+          test -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}/platforms/android-35" || {
+            echo 'Android API 35 is not preinstalled on this runner.'
+            ls -la "${ANDROID_HOME:-/usr/local/lib/android/sdk}/platforms" || true
+            exit 1
+          }
+
+      - name: Generate Pocket Player project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/java/com/pocketplayer
+          cat > settings.gradle.kts <<'GRADLE_SETTINGS'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "PocketPlayer"
+          include(":app")
+          GRADLE_SETTINGS
+
+          cat > build.gradle.kts <<'ROOT_GRADLE'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.21" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.21" apply false
+          }
+          ROOT_GRADLE
+
+          cat > gradle.properties <<'GRADLE_PROPERTIES'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          GRADLE_PROPERTIES
+
+          cat > app/build.gradle.kts <<'APP_GRADLE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+          android {
+              namespace = "com.pocketplayer"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.pocketplayer"
+                  minSdk = 26
+                  targetSdk = 35
+                  versionCode = 3
+                  versionName = "3.0.0"
+              }
+              buildFeatures { compose = true }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.12.01"))
+              implementation("androidx.activity:activity-compose:1.10.0")
+              implementation("androidx.core:core-ktx:1.15.0")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.ui:ui-tooling-preview")
+              implementation("androidx.compose.foundation:foundation")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.material:material-icons-extended")
+              implementation("androidx.media3:media3-exoplayer:1.5.1")
+              implementation("androidx.media3:media3-session:1.5.1")
+              implementation("androidx.media3:media3-common:1.5.1")
+              debugImplementation("androidx.compose.ui:ui-tooling")
+          }
+          APP_GRADLE
+
+          cat > app/src/main/AndroidManifest.xml <<'MANIFEST'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+              <application
+                  android:allowBackup="true"
+                  android:label="Pocket Player"
+                  android:theme="@android:style/Theme.Material.NoActionBar"
+                  android:supportsRtl="true">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".PlaybackService"
+                      android:exported="true"
+                      android:foregroundServiceType="mediaPlayback">
+                      <intent-filter>
+                          <action android:name="androidx.media3.session.MediaSessionService" />
+                      </intent-filter>
+                  </service>
+              </application>
+          </manifest>
+          MANIFEST
+
+          cat > app/src/main/java/com/pocketplayer/PlaybackService.kt <<'KOTLIN_SERVICE'
+          package com.pocketplayer
+
+          import androidx.media3.common.AudioAttributes
+          import androidx.media3.common.C
+          import androidx.media3.exoplayer.ExoPlayer
+          import androidx.media3.session.MediaSession
+          import androidx.media3.session.MediaSessionService
+
+          object AudioSessionHolder {
+              @Volatile var sessionId: Int = 0
+          }
+
+          class PlaybackService : MediaSessionService() {
+              private var mediaSession: MediaSession? = null
+              override fun onCreate() {
+                  super.onCreate()
+                  val audioAttributes = AudioAttributes.Builder()
+                      .setUsage(C.USAGE_MEDIA)
+                      .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC)
+                      .build()
+                  val player = ExoPlayer.Builder(this).build().apply {
+                      setAudioAttributes(audioAttributes, true)
+                      setHandleAudioBecomingNoisy(true)
+                  }
+                  AudioSessionHolder.sessionId = player.audioSessionId
+                  AudioEffectsController.attach(player.audioSessionId, player)
+                  mediaSession = MediaSession.Builder(this, player).build()
+              }
+              override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = mediaSession
+              override fun onDestroy() {
+                  AudioEffectsController.release()
+                  mediaSession?.run { player.release(); release() }
+                  mediaSession = null
+                  super.onDestroy()
+              }
+          }
+          KOTLIN_SERVICE
+
+          cat > app/src/main/java/com/pocketplayer/AudioEffectsController.kt <<'KOTLIN_AUDIO'
+          package com.pocketplayer
+
+          import android.media.audiofx.BassBoost
+          import android.media.audiofx.Equalizer
+          import android.media.audiofx.Virtualizer
+          import android.os.Handler
+          import android.os.Looper
+          import androidx.media3.exoplayer.ExoPlayer
+          import kotlin.math.abs
+          import kotlin.math.max
+          import kotlin.math.pow
+
+          /** Conservative, session-bound audio processing. All effects are optional: unsupported devices fall back safely. */
+          object AudioEffectsController {
+              private var equalizer: Equalizer? = null
+              private var bassBoost: BassBoost? = null
+              private var virtualizer: Virtualizer? = null
+              private var player: ExoPlayer? = null
+              private val mainHandler = Handler(Looper.getMainLooper())
+              private var volumeRamp: Runnable? = null
+              private val targetHz = intArrayOf(60, 230, 910, 3600, 14000)
+
+              @Synchronized fun attach(sessionId: Int, exoPlayer: ExoPlayer) {
+                  if (player === exoPlayer && equalizer != null) return
+                  releaseEffects()
+                  player = exoPlayer
+                  try { equalizer = Equalizer(0, sessionId).apply { enabled = true } } catch (_: Exception) { equalizer = null }
+                  try { bassBoost = BassBoost(0, sessionId).apply { enabled = true } } catch (_: Exception) { bassBoost = null }
+                  try { virtualizer = Virtualizer(0, sessionId).apply { enabled = true } } catch (_: Exception) { virtualizer = null }
+              }
+
+              @Synchronized fun apply(levels: List<Float>, bass: Float, width: Float) {
+                  val safeLevels = (0..4).map { i -> (levels.getOrNull(i) ?: 0f).coerceIn(-10f, 10f) }
+                  try {
+                      val eq = equalizer
+                      if (eq != null) {
+                          val range = eq.bandLevelRange
+                          val minLevel = range[0].toInt()
+                          val maxLevel = range[1].toInt()
+                          val count = eq.numberOfBands.toInt()
+                          for (bandIndex in 0 until count) {
+                              val band = bandIndex.toShort()
+                              val hz = (eq.getCenterFreq(band) / 1000).coerceAtLeast(1)
+                              val nearest = targetHz.indices.minByOrNull { abs(targetHz[it] - hz) } ?: 0
+                              // UI scale is +/-10; real EQ is deliberately capped at +/-4 dB.
+                              val requested = (safeLevels[nearest] * 50f).toInt().coerceIn(-500, 500)
+                              eq.setBandLevel(band, requested.coerceIn(minLevel, maxLevel).toShort())
+                          }
+                          eq.enabled = true
+                      }
+                  } catch (_: Exception) { /* OEM effect implementation may reject individual bands. */ }
+                  try { bassBoost?.setStrength((bass.coerceIn(0f, 1f) * 420f).toInt().toShort()); bassBoost?.enabled = true } catch (_: Exception) { }
+                  try { virtualizer?.setStrength((width.coerceIn(0f, 1f) * 380f).toInt().toShort()); virtualizer?.enabled = true } catch (_: Exception) { }
+
+                  // Compensate for positive EQ/bass gain to reduce clipping and loudness jumps.
+                  // Never auto-amplify above unity; attenuation only.
+                  val peakBoostDb = max(0f, safeLevels.maxOrNull() ?: 0f) * 0.5f + bass.coerceIn(0f, 1f) * 3.5f
+                  val safeVolume = (10.0.pow((-peakBoostDb / 20.0)).toFloat()).coerceIn(0.42f, 1.0f)
+                  // Ramp headroom changes instead of stepping the output volume abruptly.
+                  try {
+                      volumeRamp?.let { mainHandler.removeCallbacks(it) }
+                      val activePlayer = player
+                      if (activePlayer != null) {
+                          val start = activePlayer.volume
+                          val steps = 8
+                          val ramp = object : Runnable {
+                              var step = 0
+                              override fun run() {
+                                  step++
+                                  try { activePlayer.volume = start + (safeVolume - start) * (step.toFloat() / steps) } catch (_: Exception) { }
+                                  if (step < steps) mainHandler.postDelayed(this, 25L)
+                              }
+                          }
+                          volumeRamp = ramp
+                          mainHandler.post(ramp)
+                      }
+                  } catch (_: Exception) { }
+              }
+
+              @Synchronized fun release() {
+                  releaseEffects()
+                  player = null
+              }
+
+              private fun releaseEffects() {
+                  volumeRamp?.let { mainHandler.removeCallbacks(it) }
+                  volumeRamp = null
+                  try { equalizer?.release() } catch (_: Exception) { }
+                  try { bassBoost?.release() } catch (_: Exception) { }
+                  try { virtualizer?.release() } catch (_: Exception) { }
+                  equalizer = null; bassBoost = null; virtualizer = null
+              }
+          }
+          KOTLIN_AUDIO
+
+          cat > app/src/main/java/com/pocketplayer/MainActivity.kt <<'KOTLIN_MAIN'
+          package com.pocketplayer
+          
+          import android.Manifest
+          import android.content.ComponentName
+          import android.content.ContentUris
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.graphics.BitmapFactory
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.material.icons.Icons
+          import androidx.compose.material.icons.filled.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.runtime.getValue
+          import androidx.compose.runtime.setValue
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.draw.blur
+          import androidx.compose.ui.draw.shadow
+          import androidx.compose.foundation.border
+          import androidx.compose.ui.graphics.Brush
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.input.pointer.pointerInput
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.text.font.FontWeight
+          import androidx.compose.ui.text.style.TextAlign
+          import androidx.compose.ui.text.style.TextOverflow
+          import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.ContextCompat
+          import androidx.media3.common.MediaItem
+          import androidx.media3.common.MediaMetadata
+          import androidx.media3.common.Player
+          import androidx.media3.session.MediaController
+          import androidx.media3.session.SessionToken
+          import com.google.common.util.concurrent.ListenableFuture
+          import kotlinx.coroutines.delay
+          
+          private val NanoWhite = Color(0xFF11151B)
+          private val NanoPaper = Color(0xFF202630)
+          private val NanoInk = Color(0xFFF2F3F5)
+          private val NanoGray = Color(0xFF9B9DA6)
+          private val NanoLine = Color(0xFF3B4654)
+          private val NanoBlue = Color(0xFF168FE8)
+          private val NanoOrange = Color(0xFFFF9F0A)
+          private val NanoGreen = Color(0xFF69BD45)
+          private val NanoPink = Color(0xFFFF4F87)
+          private val NanoPurple = Color(0xFF9A69D8)
+          private val NanoRed = Color(0xFFFF4B43)
+          
+          private data class Track(
+              val id: Long,
+              val title: String,
+              val artist: String,
+              val album: String,
+              val albumId: Long,
+              val uri: Uri,
+              val duration: Long
+          ) {
+              val artwork: Uri get() = ContentUris.withAppendedId(Uri.parse("content://media/external/audio/albumart"), albumId)
+          }
+          
+          class MainActivity : ComponentActivity() {
+              private var controllerFuture: ListenableFuture<MediaController>? = null
+          
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  window.statusBarColor = android.graphics.Color.rgb(16, 17, 20)
+                  window.navigationBarColor = android.graphics.Color.rgb(16, 17, 20)
+                  window.decorView.systemUiVisibility = 0
+                  val controllerState = mutableStateOf<MediaController?>(null)
+                  val token = SessionToken(this, ComponentName(this, PlaybackService::class.java))
+                  controllerFuture = MediaController.Builder(this, token).buildAsync().also { future ->
+                      future.addListener({ try { controllerState.value = future.get() } catch (_: Exception) { } }, ContextCompat.getMainExecutor(this))
+                  }
+                  setContent {
+                      MaterialTheme(colorScheme = darkColorScheme(primary = NanoBlue, background = NanoWhite, surface = NanoPaper, onSurface = NanoInk)) {
+                          val controller by remember { controllerState }
+                          NanoApp(controller, loadTracks = { scanTracks(this) })
+                      }
+                  }
+              }
+          
+              override fun onDestroy() {
+                  controllerFuture?.let { MediaController.releaseFuture(it) }
+                  controllerFuture = null
+                  super.onDestroy()
+              }
+          }
+          
+          private fun scanTracks(context: Context): List<Track> {
+              val result = mutableListOf<Track>()
+              val collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+              val projection = arrayOf(MediaStore.Audio.Media._ID, MediaStore.Audio.Media.TITLE, MediaStore.Audio.Media.ARTIST, MediaStore.Audio.Media.ALBUM, MediaStore.Audio.Media.ALBUM_ID, MediaStore.Audio.Media.DURATION)
+              context.contentResolver.query(collection, projection, "${MediaStore.Audio.Media.IS_MUSIC} != 0", null, "${MediaStore.Audio.Media.TITLE} COLLATE NOCASE ASC")?.use { c ->
+                  val idCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID)
+                  val titleCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE)
+                  val artistCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST)
+                  val albumCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM)
+                  val albumIdCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM_ID)
+                  val durationCol = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
+                  while (c.moveToNext()) {
+                      val id = c.getLong(idCol)
+                      val title = c.getString(titleCol)?.takeIf { it.isNotBlank() } ?: "Unknown track"
+                      val artist = c.getString(artistCol)?.takeIf { it.isNotBlank() && it != "<unknown>" } ?: "Unknown artist"
+                      val album = c.getString(albumCol)?.takeIf { it.isNotBlank() && it != "<unknown>" } ?: "Unknown album"
+                      result.add(Track(id, title, artist, album, c.getLong(albumIdCol), ContentUris.withAppendedId(collection, id), c.getLong(durationCol)))
+                  }
+              }
+              return result
+          }
+          
+          @Composable
+          private fun NanoApp(controller: MediaController?, loadTracks: () -> List<Track>) {
+              val context = LocalContext.current
+              val prefs = remember { context.getSharedPreferences("pocket", Context.MODE_PRIVATE) }
+              val permission = if (Build.VERSION.SDK_INT >= 33) Manifest.permission.READ_MEDIA_AUDIO else Manifest.permission.READ_EXTERNAL_STORAGE
+              var allowed by remember { mutableStateOf(ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED) }
+              var tracks by remember { mutableStateOf(emptyList<Track>()) }
+              var page by remember { mutableStateOf("HOME") }
+              var search by remember { mutableStateOf("") }
+              var currentId by remember { mutableLongStateOf(-1L) }
+              var playing by remember { mutableStateOf(false) }
+              var position by remember { mutableLongStateOf(0L) }
+              var duration by remember { mutableLongStateOf(1L) }
+              var shuffle by remember { mutableStateOf(false) }
+              var repeat by remember { mutableIntStateOf(Player.REPEAT_MODE_OFF) }
+              var favorites by remember { mutableStateOf(prefs.getString("favorites_csv", "")!!.split("|").filter { it.isNotBlank() }) }
+              var history by remember { mutableStateOf(prefs.getString("history_csv", "")!!.split("|").filter { it.isNotBlank() }) }
+              var bass by remember { mutableFloatStateOf(prefs.getFloat("sound_bass", 0.28f).coerceIn(0f, 1f)) }
+              var space by remember { mutableFloatStateOf(prefs.getFloat("sound_space", 0.16f).coerceIn(0f, 1f)) }
+              var eqPreset by remember { mutableStateOf(prefs.getString("sound_preset", "Rich") ?: "Rich") }
+              var eqLevels by remember { mutableStateOf(prefs.getString("sound_eq", "4,3,0,2,3")!!.split(",").mapNotNull { it.toFloatOrNull() }.take(5).let { saved -> if (saved.size == 5) saved else listOf(4f, 3f, 0f, 2f, 3f) }) }
+              LaunchedEffect(bass, space, eqLevels, controller) {
+                  AudioEffectsController.apply(eqLevels, bass, space)
+                  prefs.edit()
+                      .putFloat("sound_bass", bass)
+                      .putFloat("sound_space", space)
+                      .putString("sound_eq", eqLevels.joinToString(","))
+                      .apply()
+              }
+              val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+                  allowed = granted
+                  if (granted) tracks = loadTracks()
+              }
+              LaunchedEffect(allowed) {
+                  if (allowed) tracks = loadTracks() else permissionLauncher.launch(permission)
+              }
+              LaunchedEffect(controller) {
+                  while (true) {
+                      val p = controller
+                      if (p != null) {
+                          playing = p.isPlaying
+                          currentId = p.currentMediaItem?.mediaId?.toLongOrNull() ?: currentId
+                          position = p.currentPosition.coerceAtLeast(0L)
+                          duration = p.duration.takeIf { it > 0L } ?: 1L
+                          shuffle = p.shuffleModeEnabled
+                          repeat = p.repeatMode
+                      }
+                      delay(300)
+                  }
+              }
+              DisposableEffect(controller) {
+                  val listener = object : Player.Listener {
+                      override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                          val id = mediaItem?.mediaId ?: return
+                          history = (history.filterNot { it == id } + id).takeLast(500)
+                          prefs.edit().putString("history_csv", history.joinToString("|")).apply()
+                      }
+                  }
+                  controller?.addListener(listener)
+                  onDispose { controller?.removeListener(listener) }
+              }
+              val current = tracks.firstOrNull { it.id == currentId }
+              val filtered = tracks.filter { (it.title + " " + it.artist + " " + it.album).contains(search, true) }
+          
+              Column(Modifier.fillMaxSize().background(NanoWhite)) {
+                  if (page != "HOME") NanoHeader(page = page, onBack = { page = when (page) { "SOUND" -> "SETTINGS"; "LYRICS", "QUEUE" -> "PLAYING"; else -> "HOME" } }, onHome = { page = "HOME" })
+                  when (page) {
+                      "HOME" -> NanoHome(onOpen = { page = it }, current = current, playing = playing, onPlay = { page = "PLAYING"; if ((controller?.mediaItemCount ?: 0) > 0) controller?.play() })
+                      "MUSIC", "ALBUMS", "ARTISTS", "FAVORITES", "HISTORY", "QUEUE" -> NanoLibrary(
+                          page, filtered, tracks, search, { search = it }, currentId, favorites, history, controller,
+                          onPage = { page = it }, onPlay = { track, list ->
+                              val playlist = if (list.isEmpty()) tracks else list
+                              val index = playlist.indexOfFirst { it.id == track.id }
+                              if (index >= 0) {
+                                  controller?.setMediaItems(playlist.map { item -> MediaItem.Builder().setMediaId(item.id.toString()).setUri(item.uri).setMediaMetadata(MediaMetadata.Builder().setTitle(item.title).setArtist(item.artist).setAlbumTitle(item.album).build()).build() }, index, 0L)
+                                  controller?.prepare(); controller?.play(); page = "PLAYING"
+                              }
+                          }, onRemoveQueue = { index -> controller?.removeMediaItem(index) }
+                      )
+                      "PLAYING" -> NanoNowPlaying(current, controller, playing, position, duration, favorites.contains(current?.id?.toString() ?: ""), onFavorite = {
+                          current?.let { track ->
+                              val id = track.id.toString()
+                              favorites = if (favorites.contains(id)) favorites.filterNot { it == id } else favorites + id
+                              prefs.edit().putString("favorites_csv", favorites.joinToString("|")).apply()
+                          }
+                      }, onQueue = { page = "QUEUE" }, onLyrics = { page = "LYRICS" }, onSound = { page = "SOUND" }, onNext = { controller?.seekToNextMediaItem() }, onPrev = { controller?.seekToPreviousMediaItem() }, onToggle = { if (controller?.isPlaying == true) controller.pause() else controller?.play() }, onSeek = { controller?.seekTo(it) }, onSwipe = { direction -> if (direction < 0) controller?.seekToNextMediaItem() else controller?.seekToPreviousMediaItem() }, onShuffle = { controller?.shuffleModeEnabled = !(controller?.shuffleModeEnabled ?: false); shuffle = controller?.shuffleModeEnabled ?: false }, shuffle = shuffle, repeat = repeat, onRepeat = { val next = when (repeat) { Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL; Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE; else -> Player.REPEAT_MODE_OFF }; controller?.repeatMode = next; repeat = next })
+                      "SETTINGS" -> NanoSettings(onSound = { page = "SOUND" }, onLibrary = { page = "MUSIC" }, onFavorites = { page = "FAVORITES" }, onHistory = { page = "HISTORY" }, onHome = { page = "HOME" })
+                      "SOUND" -> NanoSound(bass, space, eqPreset, eqLevels, { bass = it }, { space = it }, { eqPreset = it; prefs.edit().putString("sound_preset", it).apply(); eqLevels = when (it) { "Rich" -> listOf(4f, 3f, 0f, 2f, 3f); "Bass" -> listOf(7f, 5f, 1f, 0f, 0f); "Rock" -> listOf(5f, 3f, -1f, 3f, 5f); "Vocal" -> listOf(-2f, 0f, 4f, 3f, 0f); "Treble" -> listOf(-1f, 0f, 1f, 4f, 7f); else -> listOf(0f, 0f, 0f, 0f, 0f) } }, { index, value -> eqLevels = eqLevels.mapIndexed { i, old -> if (i == index) value else old } })
+                      "LYRICS" -> NanoLyrics(current)
+                      else -> NanoHome(onOpen = { page = it }, current = current, playing = playing, onPlay = { page = "PLAYING" })
+                  }
+              }
+          }
+          
+          @Composable
+          private fun NanoHeader(page: String, onBack: () -> Unit, onHome: () -> Unit) {
+              val title = when (page) { "MUSIC" -> "Songs"; "ALBUMS" -> "Albums"; "ARTISTS" -> "Artists"; "PLAYING" -> "Now Playing"; "FAVORITES" -> "Favorites"; "HISTORY" -> "Recently Played"; "QUEUE" -> "Up Next"; "SETTINGS" -> "Settings"; "SOUND" -> "Sound Check"; "LYRICS" -> "Lyrics"; else -> page.lowercase().replaceFirstChar { it.uppercase() } }
+              Column(Modifier.fillMaxWidth().background(Brush.verticalGradient(listOf(Color(0xFF303B4A), Color(0xFF171D26), Color(0xFF11151B))))) {
+                  Row(Modifier.fillMaxWidth().height(52.dp).padding(horizontal = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                      Row(Modifier.width(78.dp).clickable { onBack() }, verticalAlignment = Alignment.CenterVertically) { Icon(Icons.Default.ChevronLeft, null, tint = NanoBlue, modifier = Modifier.size(26.dp)); Text("Back", color = NanoBlue, fontSize = 16.sp) }
+                      Text(title, modifier = Modifier.weight(1f), color = NanoInk, fontWeight = FontWeight.SemiBold, fontSize = 17.sp, textAlign = TextAlign.Center, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                      Box(Modifier.width(78.dp), contentAlignment = Alignment.CenterEnd) { Text("Home", color = NanoBlue, fontSize = 16.sp, modifier = Modifier.clickable { onHome() }.padding(end = 4.dp)) }
+                  }
+                  HorizontalDivider(color = Color.White.copy(alpha = 0.12f), thickness = 0.7.dp)
+              }
+          }
+          
+          @Composable
+          private fun NanoHome(onOpen: (String) -> Unit, current: Track?, playing: Boolean, onPlay: () -> Unit) {
+              val tiles = listOf(
+                  Triple("Music", Icons.Default.MusicNote, NanoOrange), Triple("Videos", Icons.Default.Videocam, NanoPurple),
+                  Triple("Photos", Icons.Default.PhotoLibrary, Color(0xFF4AA6EF)), Triple("Podcasts", Icons.Default.Podcasts, NanoPurple),
+                  Triple("Radio", Icons.Default.Radio, NanoRed), Triple("Fitness", Icons.Default.DirectionsRun, NanoGreen),
+                  Triple("Clock", Icons.Default.AccessTime, Color(0xFF37373C)), Triple("Settings", Icons.Default.Settings, Color(0xFF9A9AA0))
+              )
+              Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF303B49), Color(0xFF1A2029), Color(0xFF0C1016)))), horizontalAlignment = Alignment.CenterHorizontally) {
+                  Spacer(Modifier.height(18.dp))
+                  Text("iPod", color = Color(0xFFE8F2FF), fontSize = 13.sp, fontWeight = FontWeight.Medium, letterSpacing = 2.2.sp, modifier = Modifier.shadow(5.dp, RoundedCornerShape(8.dp)))
+                  Spacer(Modifier.height(18.dp))
+                  Column(Modifier.fillMaxWidth().weight(1f).padding(horizontal = 21.dp), verticalArrangement = Arrangement.spacedBy(23.dp)) {
+                      tiles.chunked(4).forEach { row ->
+                          Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                              row.forEach { (label, icon, color) ->
+                                  Column(Modifier.weight(1f).clickable { when (label) { "Music" -> onOpen("MUSIC"); "Settings" -> onOpen("SETTINGS"); "Radio" -> onOpen("MUSIC"); else -> onOpen("MUSIC") } }, horizontalAlignment = Alignment.CenterHorizontally) {
+                                      Box(Modifier.size(61.dp).shadow(8.dp, RoundedCornerShape(15.dp)).clip(RoundedCornerShape(15.dp)).background(Brush.verticalGradient(listOf(color.copy(alpha = 0.98f), color, color.copy(red = (color.red * 0.54f).coerceIn(0f, 1f), green = (color.green * 0.54f).coerceIn(0f, 1f), blue = (color.blue * 0.54f).coerceIn(0f, 1f))))).border(1.dp, Color.White.copy(alpha = 0.62f), RoundedCornerShape(15.dp)), contentAlignment = Alignment.Center) {
+                                          Box(Modifier.fillMaxWidth().fillMaxHeight(0.44f).align(Alignment.TopCenter).background(Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.30f), Color.White.copy(alpha = 0.08f), Color.Transparent))))
+                                          Box(Modifier.fillMaxWidth(0.64f).height(2.dp).align(Alignment.TopCenter).background(Color.White.copy(alpha = 0.36f)).blur(2.dp))
+                                          Icon(icon, null, tint = Color.White, modifier = Modifier.size(31.dp).shadow(2.dp, CircleShape))
+                                      }
+                                      Spacer(Modifier.height(7.dp))
+                                      Text(label, color = NanoInk, fontSize = 11.sp, maxLines = 1)
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  if (current != null) {
+                      HorizontalDivider(color = NanoLine, thickness = 0.7.dp)
+                      Row(Modifier.fillMaxWidth().clickable { onPlay() }.padding(horizontal = 15.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+                          NanoArtwork(current, Modifier.size(39.dp))
+                          Column(Modifier.weight(1f).padding(start = 10.dp)) { Text(current.title, color = NanoInk, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis); Text(current.artist, color = NanoGray, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                          Icon(if (playing) Icons.Default.Pause else Icons.Default.PlayArrow, null, tint = NanoBlue, modifier = Modifier.clickable { onPlay() }.size(27.dp))
+                      }
+                  }
+                  Row(Modifier.fillMaxWidth().height(29.dp), horizontalArrangement = Arrangement.Center, verticalAlignment = Alignment.CenterVertically) {
+                      repeat(3) { index -> Box(Modifier.padding(horizontal = 3.dp).size(if (index == 0) 6.dp else 5.dp).clip(CircleShape).background(if (index == 0) NanoGray else NanoLine)) }
+                  }
+              }
+          }
+          
+          @Composable
+          private fun NanoLibrary(page: String, filtered: List<Track>, tracks: List<Track>, search: String, onSearch: (String) -> Unit, currentId: Long, favorites: List<String>, history: List<String>, controller: MediaController?, onPage: (String) -> Unit, onPlay: (Track, List<Track>) -> Unit, onRemoveQueue: (Int) -> Unit) {
+              val rows = when (page) {
+                  "ALBUMS" -> filtered.distinctBy { it.albumId }.sortedBy { it.album.lowercase() }
+                  "ARTISTS" -> filtered.distinctBy { it.artist }.sortedBy { it.artist.lowercase() }
+                  "FAVORITES" -> filtered.filter { favorites.contains(it.id.toString()) }
+                  "HISTORY" -> history.asReversed().mapNotNull { id -> tracks.firstOrNull { it.id.toString() == id } }
+                  "QUEUE" -> (0 until (controller?.mediaItemCount ?: 0)).mapNotNull { i -> tracks.firstOrNull { it.id.toString() == controller?.getMediaItemAt(i)?.mediaId } }
+                  else -> filtered
+              }
+              Column(Modifier.fillMaxSize().background(NanoWhite)) {
+                  if (page == "MUSIC" || page == "ALBUMS" || page == "ARTISTS") {
+                      Row(Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 8.dp), horizontalArrangement = Arrangement.spacedBy(18.dp)) {
+                          listOf("Songs" to "MUSIC", "Albums" to "ALBUMS", "Artists" to "ARTISTS").forEach { (label, destination) ->
+                              Column(Modifier.clickable { onPage(destination) }, horizontalAlignment = Alignment.CenterHorizontally) {
+                                  Text(label, color = if (page == destination) NanoBlue else NanoGray, fontSize = 14.sp, fontWeight = if (page == destination) FontWeight.SemiBold else FontWeight.Normal)
+                                  Spacer(Modifier.height(5.dp)); Box(Modifier.width(42.dp).height(2.dp).background(if (page == destination) NanoBlue else Color.Transparent))
+                              }
+                          }
+                      }
+                  }
+                  if (page != "QUEUE") {
+                      Row(Modifier.fillMaxWidth().padding(horizontal = 13.dp, vertical = 7.dp).shadow(3.dp, RoundedCornerShape(10.dp)).clip(RoundedCornerShape(10.dp)).background(Brush.verticalGradient(listOf(Color(0xFF303A47), Color(0xFF171D26)))).border(1.dp, Color.White.copy(alpha = 0.14f), RoundedCornerShape(10.dp)).padding(horizontal = 9.dp, vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+                          Icon(Icons.Default.Search, null, tint = NanoGray, modifier = Modifier.size(19.dp))
+                          androidx.compose.foundation.text.BasicTextField(value = search, onValueChange = onSearch, modifier = Modifier.weight(1f).padding(start = 7.dp), singleLine = true, textStyle = androidx.compose.ui.text.TextStyle(color = NanoInk, fontSize = 14.sp), decorationBox = { inner -> if (search.isEmpty()) Text("Search", color = NanoGray, fontSize = 14.sp); inner() })
+                          if (search.isNotEmpty()) Icon(Icons.Default.Close, null, tint = NanoGray, modifier = Modifier.size(17.dp).clickable { onSearch("") })
+                      }
+                  }
+                  if (rows.isEmpty()) {
+                      Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Column(horizontalAlignment = Alignment.CenterHorizontally) { Icon(Icons.Default.MusicNote, null, tint = NanoLine, modifier = Modifier.size(44.dp)); Spacer(Modifier.height(9.dp)); Text(if (page == "QUEUE") "No songs in Up Next" else if (page == "FAVORITES") "No Favorites" else "No Music", color = NanoGray, fontSize = 15.sp); Text("Your music on this device appears here", color = NanoGray, fontSize = 11.sp) } }
+                  } else {
+                      LazyColumn(Modifier.fillMaxSize()) {
+                          items(rows, key = { "${page}_${it.id}" }) { track ->
+                              val label = when (page) { "ALBUMS" -> track.album; "ARTISTS" -> track.artist; else -> track.title }
+                              val subtitle = when (page) { "ALBUMS" -> track.artist + " · " + tracks.count { it.albumId == track.albumId } + " songs"; "ARTISTS" -> tracks.count { it.artist == track.artist }.toString() + " songs"; else -> track.artist }
+                              Row(Modifier.fillMaxWidth().clickable {
+                                  val list = when (page) { "ALBUMS" -> tracks.filter { it.albumId == track.albumId }; "ARTISTS" -> tracks.filter { it.artist == track.artist }; "FAVORITES", "HISTORY" -> rows; else -> filtered }
+                                  onPlay(track, list)
+                              }.padding(start = 14.dp, end = 13.dp, top = 7.dp, bottom = 7.dp), verticalAlignment = Alignment.CenterVertically) {
+                                  NanoArtwork(track, Modifier.size(43.dp))
+                                  Column(Modifier.weight(1f).padding(start = 11.dp, end = 8.dp)) {
+                                      Text(label, color = if (track.id == currentId) NanoBlue else NanoInk, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                      Text(subtitle, color = NanoGray, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                  }
+                                  if (page == "QUEUE") Icon(Icons.Default.Close, null, tint = NanoGray, modifier = Modifier.size(18.dp).clickable { onRemoveQueue(rows.indexOf(track)) })
+                                  else Icon(Icons.Default.PlayArrow, null, tint = if (track.id == currentId) NanoBlue else NanoGray, modifier = Modifier.size(22.dp).clickable { onPlay(track, rows) })
+                              }
+                              HorizontalDivider(color = NanoLine, thickness = 0.65.dp, modifier = Modifier.padding(start = 68.dp))
+                          }
+                      }
+                  }
+              }
+          }
+          
+          @Composable
+          private fun NanoArtwork(track: Track?, modifier: Modifier = Modifier) {
+              val context = LocalContext.current
+              val bitmap by produceState<android.graphics.Bitmap?>(initialValue = null, track?.albumId) {
+                  value = if (track == null) null else try { context.contentResolver.openInputStream(track.artwork)?.use { BitmapFactory.decodeStream(it) } } catch (_: Exception) { null }
+              }
+              Box(modifier.shadow(5.dp, RoundedCornerShape(4.dp)).clip(RoundedCornerShape(4.dp)).background(Brush.verticalGradient(listOf(Color(0xFF3A4656), Color(0xFF151A22)))).border(1.dp, Color.White.copy(alpha = 0.30f), RoundedCornerShape(4.dp)), contentAlignment = Alignment.Center) {
+                  if (bitmap != null) Image(bitmap!!.asImageBitmap(), contentDescription = "Album artwork", modifier = Modifier.fillMaxSize())
+                  else Icon(Icons.Default.MusicNote, null, tint = Color(0xFF9AAFC6), modifier = Modifier.size(23.dp))
+                  Box(Modifier.fillMaxWidth().fillMaxHeight(0.30f).align(Alignment.TopCenter).background(Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.18f), Color.White.copy(alpha = 0.04f), Color.Transparent))))
+              }
+          }
+          
+          @Composable
+          private fun NanoGlossButton(
+              icon: androidx.compose.ui.graphics.vector.ImageVector,
+              contentDescription: String?,
+              modifier: Modifier = Modifier,
+              active: Boolean = false,
+              accent: Color = NanoBlue,
+              iconSize: androidx.compose.ui.unit.Dp = 25.dp,
+              onClick: () -> Unit
+          ) {
+              val top = if (active) accent.copy(red = (accent.red + 0.16f).coerceAtMost(1f), green = (accent.green + 0.16f).coerceAtMost(1f), blue = (accent.blue + 0.16f).coerceAtMost(1f)) else Color(0xFF46515F)
+              val bottom = if (active) accent.copy(red = (accent.red * 0.62f), green = (accent.green * 0.62f), blue = (accent.blue * 0.62f)) else Color(0xFF202833)
+              Box(
+                  Modifier.padding(2.dp).size(43.dp).shadow(5.dp, CircleShape).clip(CircleShape)
+                      .background(Brush.verticalGradient(listOf(top, if (active) accent else Color(0xFF303A47), bottom)))
+                      .border(1.dp, Color.White.copy(alpha = 0.34f), CircleShape)
+                      .clickable { onClick() },
+                  contentAlignment = Alignment.Center
+              ) {
+                  Box(Modifier.fillMaxWidth(0.76f).fillMaxHeight(0.32f).align(Alignment.TopCenter).padding(top = 2.dp).clip(RoundedCornerShape(100)).background(Color.White.copy(alpha = if (active) 0.24f else 0.13f)))
+                  Icon(icon, contentDescription, tint = Color(0xFFF5F8FC), modifier = Modifier.size(iconSize))
+              }
+          }
+
+          @Composable
+          private fun NanoNowPlaying(track: Track?, controller: MediaController?, playing: Boolean, position: Long, duration: Long, favorite: Boolean, onFavorite: () -> Unit, onQueue: () -> Unit, onLyrics: () -> Unit, onSound: () -> Unit, onNext: () -> Unit, onPrev: () -> Unit, onToggle: () -> Unit, onSeek: (Long) -> Unit, onSwipe: (Float) -> Unit, onShuffle: () -> Unit, shuffle: Boolean, repeat: Int, onRepeat: () -> Unit) {
+              var slider by remember(track?.id) { mutableFloatStateOf(0f) }
+              Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF354253), Color(0xFF1A212B), Color(0xFF0A0D12)))).padding(horizontal = 25.dp).pointerInput(track?.id) { var drag = 0f; detectHorizontalDragGestures(onHorizontalDrag = { _, amount -> drag += amount }, onDragEnd = { if (kotlin.math.abs(drag) > 55f) onSwipe(drag); drag = 0f }) }, horizontalAlignment = Alignment.CenterHorizontally) {
+                  Spacer(Modifier.height(13.dp))
+                  Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                      Box(Modifier.fillMaxWidth().aspectRatio(1f).padding(3.dp).shadow(18.dp, RoundedCornerShape(7.dp)).clip(RoundedCornerShape(7.dp)).background(Brush.verticalGradient(listOf(Color(0xFF536174), Color(0xFF202936), Color(0xFF080B10)))).border(1.dp, Color.White.copy(alpha = 0.24f), RoundedCornerShape(7.dp)).padding(4.dp), contentAlignment = Alignment.Center) {
+                          NanoArtwork(track, Modifier.fillMaxSize())
+                          Box(Modifier.fillMaxWidth().fillMaxHeight(0.23f).align(Alignment.TopCenter).background(Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.16f), Color.White.copy(alpha = 0.035f), Color.Transparent))))
+                      }
+                  }
+                  Spacer(Modifier.height(15.dp))
+                  Text(track?.title ?: "Not Playing", color = NanoInk, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  Spacer(Modifier.height(4.dp))
+                  Text(track?.artist ?: "Choose music from your library", color = NanoGray, fontSize = 13.sp, textAlign = TextAlign.Center, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                  Spacer(Modifier.height(12.dp))
+                  Slider(value = (position.toFloat() / duration.coerceAtLeast(1L).toFloat()).coerceIn(0f, 1f), onValueChange = { slider = it }, onValueChangeFinished = { onSeek((slider * duration).toLong()) }, modifier = Modifier.fillMaxWidth().height(24.dp), colors = SliderDefaults.colors(thumbColor = NanoBlue, activeTrackColor = NanoBlue, inactiveTrackColor = NanoLine))
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text(formatTime(position), color = NanoGray, fontSize = 10.sp); Text("-" + formatTime((duration - position).coerceAtLeast(0L)), color = NanoGray, fontSize = 10.sp) }
+                  Spacer(Modifier.height(12.dp))
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                      NanoGlossButton(Icons.Default.Shuffle, "Shuffle", modifier = Modifier.size(39.dp), active = shuffle, iconSize = 17.dp, onClick = onShuffle)
+                      NanoGlossButton(Icons.Default.SkipPrevious, "Previous", iconSize = 27.dp, onClick = onPrev)
+                      Box(Modifier.size(75.dp), contentAlignment = Alignment.Center) {
+                          Box(Modifier.matchParentSize().background(Brush.radialGradient(listOf(NanoBlue.copy(alpha = 0.48f), NanoBlue.copy(alpha = 0.16f), Color.Transparent))).blur(12.dp))
+                          Box(Modifier.size(59.dp).shadow(7.dp, CircleShape).clip(CircleShape).background(Brush.verticalGradient(listOf(Color(0xFF66C5FF), NanoBlue, Color(0xFF07569D)))).border(1.dp, Color.White.copy(alpha = 0.42f), CircleShape).clickable { onToggle() }, contentAlignment = Alignment.Center) {
+                              Box(Modifier.fillMaxWidth(0.74f).fillMaxHeight(0.25f).align(Alignment.TopCenter).padding(top = 3.dp).clip(CircleShape).background(Color.White.copy(alpha = 0.25f)))
+                              Icon(if (playing) Icons.Default.Pause else Icons.Default.PlayArrow, null, tint = Color.White, modifier = Modifier.size(34.dp))
+                          }
+                      }
+                      NanoGlossButton(Icons.Default.SkipNext, "Next", iconSize = 27.dp, onClick = onNext)
+                      NanoGlossButton(if (repeat == Player.REPEAT_MODE_ONE) Icons.Default.RepeatOne else Icons.Default.Repeat, "Repeat", modifier = Modifier.size(39.dp), active = repeat != Player.REPEAT_MODE_OFF, iconSize = 17.dp, onClick = onRepeat)
+                  }
+                  Spacer(Modifier.height(8.dp))
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                      IconButton(onClick = onFavorite) { Icon(if (favorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder, null, tint = if (favorite) NanoPink else NanoGray) }
+                      Text("Lyrics", color = NanoBlue, fontSize = 12.sp, modifier = Modifier.clickable { onLyrics() }.padding(8.dp))
+                      Text("Up Next", color = NanoBlue, fontSize = 12.sp, modifier = Modifier.clickable { onQueue() }.padding(8.dp))
+                      IconButton(onClick = onSound) { Icon(Icons.Default.Equalizer, null, tint = NanoGray) }
+                  }
+                  Spacer(Modifier.height(8.dp))
+              }
+          }
+          
+          @Composable
+          private fun NanoSettings(onSound: () -> Unit, onLibrary: () -> Unit, onFavorites: () -> Unit, onHistory: () -> Unit, onHome: () -> Unit) {
+              Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF2B3542), Color(0xFF11151B))))) {
+                  NanoSettingRow("Sound Check", "Equalizer, bass and stereo space", Icons.Default.Equalizer, onSound)
+                  NanoSettingRow("Music Library", "Browse songs, albums and artists", Icons.Default.LibraryMusic, onLibrary)
+                  NanoSettingRow("Favorites", "Your liked tracks", Icons.Default.FavoriteBorder, onFavorites)
+                  NanoSettingRow("Recently Played", "Playback history", Icons.Default.History, onHistory)
+                  NanoSettingRow("About", "Pocket Player · nano-style interface", Icons.Default.Info, onHome)
+              }
+          }
+          
+          @Composable
+          private fun NanoSettingRow(title: String, subtitle: String, icon: androidx.compose.ui.graphics.vector.ImageVector, action: () -> Unit) {
+              Column(Modifier.fillMaxWidth().clickable { action() }) {
+                  Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+                      Icon(icon, null, tint = NanoBlue, modifier = Modifier.size(25.dp))
+                      Column(Modifier.weight(1f).padding(start = 14.dp)) { Text(title, color = NanoInk, fontSize = 15.sp); Text(subtitle, color = NanoGray, fontSize = 11.sp) }
+                      Icon(Icons.Default.ChevronRight, null, tint = NanoGray, modifier = Modifier.size(21.dp))
+                  }
+                  HorizontalDivider(color = NanoLine, thickness = 0.65.dp, modifier = Modifier.padding(start = 54.dp))
+              }
+          }
+          
+          @Composable
+          private fun NanoSound(bass: Float, space: Float, preset: String, levels: List<Float>, onBass: (Float) -> Unit, onSpace: (Float) -> Unit, onPreset: (String) -> Unit, onLevel: (Int, Float) -> Unit) {
+              Column(Modifier.fillMaxSize().background(Brush.verticalGradient(listOf(Color(0xFF303B49), Color(0xFF171D26), Color(0xFF0E1218)))).padding(horizontal = 18.dp)) {
+                  Spacer(Modifier.height(12.dp))
+                  Text("Equalizer", color = NanoInk, fontSize = 21.sp, fontWeight = FontWeight.Medium)
+                  Spacer(Modifier.height(12.dp))
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                      listOf("Rich", "Bass", "Rock", "Vocal", "Treble", "Flat").forEach { name ->
+                          Column(Modifier.weight(1f).shadow(if (preset == name) 6.dp else 2.dp, RoundedCornerShape(7.dp)).clip(RoundedCornerShape(7.dp)).background(Brush.verticalGradient(if (preset == name) listOf(Color(0xFF8CDBFF), Color(0xFF168FE8), Color(0xFF064B8D)) else listOf(Color(0xFF536174), Color(0xFF303A47), Color(0xFF171D26)))).border(1.dp, Color.White.copy(alpha = if (preset == name) 0.45f else 0.20f), RoundedCornerShape(7.dp)).clickable { onPreset(name) }.padding(vertical = 9.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                              Box(Modifier.fillMaxWidth().height(5.dp).background(Brush.verticalGradient(listOf(Color.White.copy(alpha = 0.20f), Color.Transparent))))
+                              Text(name, color = Color.White, fontSize = 10.sp, maxLines = 1)
+                          }
+                      }
+                  }
+                  Spacer(Modifier.height(15.dp))
+                  Row(Modifier.fillMaxWidth().height(190.dp), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                      levels.forEachIndexed { index, level ->
+                          Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                              Text("${level.toInt()}", color = NanoGray, fontSize = 10.sp)
+                              Slider(value = level, onValueChange = { onLevel(index, it) }, valueRange = -10f..10f, modifier = Modifier.height(142.dp).width(32.dp), colors = SliderDefaults.colors(thumbColor = NanoBlue, activeTrackColor = NanoBlue, inactiveTrackColor = NanoLine))
+                              Text(listOf("60", "230", "910", "3.6k", "14k")[index], color = NanoGray, fontSize = 9.sp)
+                          }
+                      }
+                  }
+                  HorizontalDivider(color = NanoLine)
+                  NanoSoundSlider("Clear Bass", bass, onBass, "Off", "Max")
+                  HorizontalDivider(color = NanoLine)
+                  NanoSoundSlider("Stereo Width", space, onSpace, "Narrow", "Wide")
+                  Spacer(Modifier.height(10.dp))
+                  Text("Sound effects depend on Android and the connected audio device.", color = NanoGray, fontSize = 11.sp)
+              }
+          }
+          
+          @Composable
+          private fun NanoSoundSlider(title: String, value: Float, onValue: (Float) -> Unit, low: String, high: String) {
+              Column(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text(title, color = NanoInk, fontSize = 15.sp); Text("${(value * 100).toInt()}%", color = NanoGray, fontSize = 12.sp) }
+                  Slider(value = value, onValueChange = onValue, valueRange = 0f..1f, colors = SliderDefaults.colors(thumbColor = NanoBlue, activeTrackColor = NanoBlue, inactiveTrackColor = NanoLine))
+                  Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) { Text(low, color = NanoGray, fontSize = 10.sp); Text(high, color = NanoGray, fontSize = 10.sp) }
+              }
+          }
+          
+          @Composable
+          private fun NanoLyrics(track: Track?) {
+              Column(Modifier.fillMaxSize().background(NanoWhite).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                  Icon(Icons.Default.Subject, null, tint = NanoBlue, modifier = Modifier.size(40.dp))
+                  Spacer(Modifier.height(12.dp)); Text(track?.title ?: "Not Playing", color = NanoInk, fontSize = 17.sp, fontWeight = FontWeight.SemiBold, textAlign = TextAlign.Center)
+                  Text(track?.artist ?: "", color = NanoGray, fontSize = 12.sp)
+                  Spacer(Modifier.height(12.dp)); Text("Lyrics and timed .lrc import are not included in this build yet.", color = NanoGray, fontSize = 12.sp, textAlign = TextAlign.Center)
+              }
+          }
+          
+          private fun formatTime(ms: Long): String {
+              val seconds = (ms / 1000L).coerceAtLeast(0L)
+              return "%d:%02d".format(seconds / 60L, seconds % 60L)
+          }
+          KOTLIN_MAIN
+
+          cat > README.md <<'README'
+          # Pocket Player — dark iPod nano 7 interface recreation
+          Pocket Player is an independent dark recreation inspired by the iPod nano 7 interface: circular home-screen icons, compact lists, blue navigation, and a Now Playing screen with shuffle/repeat. Includes local music scanning, search, album/artist views, favorites/history, queue, Media3 background playback and lock-screen media controls. Android Equalizer, BassBoost and Virtualizer are attached to the playback audio session where supported. A richer starting EQ profile, bounded bass boost and stereo widening are included; EQ is capped at +/-5 dB and positive gain is compensated with attenuation to reduce clipping. OEM effects vary and still require listening tests on the target device. The UI uses layered gradients, reflective highlights, raised glossy transport buttons and dark graphite/Apple-blue colours; it is an inspired recreation, not a pixel-perfect Apple UI.
+          Build output: `app/build/outputs/apk/debug/app-debug.apk`.
+          Known limitations: lyrics import/timed display and ID3 tag/artwork editing are not implemented. Android sound effects depend on device and audio route. Exact pixel-for-pixel Apple UI reproduction is not guaranteed. This is an independent recreation of the iPod nano 7 interface style, not an Apple product.
+          README
+
+      - name: Build debug APK
+        run: gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: pocket-player-nano-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
